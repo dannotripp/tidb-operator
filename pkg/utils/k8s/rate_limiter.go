@@ -26,6 +26,15 @@ const (
 	controllerMaxInterval = 1 * time.Minute
 )
 
-var RateLimiter = workqueue.NewTypedMaxOfRateLimiter[ctrl.Request](
-	workqueue.NewTypedItemExponentialFailureRateLimiter[ctrl.Request](controllerInitDelay, controllerMaxInterval),
-)
+// NewRateLimiter returns an independent controller rate limiter. Controllers
+// that reconcile the same object keys must use separate instances so one
+// controller's failures and successful Forget calls cannot alter another
+// controller's retry history.
+func NewRateLimiter() workqueue.TypedRateLimiter[ctrl.Request] {
+	return workqueue.NewTypedMaxOfRateLimiter[ctrl.Request](
+		workqueue.NewTypedItemExponentialFailureRateLimiter[ctrl.Request](controllerInitDelay, controllerMaxInterval),
+	)
+}
+
+// RateLimiter is retained for existing controller registrations.
+var RateLimiter = NewRateLimiter()
