@@ -11,7 +11,7 @@ spec:
     name: canary
   schedule: "0 2 * * *"
   pause: true
-  maxBackups: 0
+  maxBackups: 3
   backupTemplate:
     backupMode: snapshot
     cleanPolicy: Retain

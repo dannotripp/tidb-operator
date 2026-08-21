@@ -1,4 +1,4 @@
-# BackupSchedule scheduling guide
+# BackupSchedule operator guide
 
 <!-- toc -->
 - [Supported scope](#supported-scope)
@@ -10,6 +10,7 @@
   - [Pause, resume, and catch-up](#pause-resume-and-catch-up)
   - [Overlap behavior](#overlap-behavior)
 - [Generated Backup identity](#generated-backup-identity)
+- [Retention and remote cleanup](#retention-and-remote-cleanup)
 - [Status and fail-closed behavior](#status-and-fail-closed-behavior)
 - [Rollout order](#rollout-order)
 - [Staging validation](#staging-validation)
@@ -17,12 +18,13 @@
 <!-- /toc -->
 
 `BackupSchedule` creates deterministic snapshot `Backup` objects from a UTC
-schedule. This first TiDB Operator v2 stage implements scheduling only. It does
-not delete Backup objects or remote backup data.
+schedule and prunes old Backup objects according to `maxBackups`. This second
+TiDB Operator v2 stage layers retention onto the scheduling implementation. It
+is intentionally narrower than the full API surface exposed by the CRD.
 
 ## Supported scope
 
-This stage supports:
+This implementation supports:
 
 - Snapshot Backups only. `backupTemplate.backupMode` may be omitted or set to
   `snapshot`.
@@ -30,8 +32,8 @@ This stage supports:
   duration of at least one minute.
 - Exactly one storage provider in `backupTemplate`: S3, GCS, Azure Blob, or
   Local.
-- `maxBackups` omitted or set to `0`. Any positive value fails closed until the
-  separate retention stage is installed.
+- An optional nonnegative `maxBackups`. A missing value or `0` disables all
+  retention pruning.
 - Pause and resume without backfilling occurrences consumed while paused.
 - Best-effort overlap avoidance for all snapshot Backups targeting the same
   TiDB cluster.
@@ -87,9 +89,11 @@ kubectl apply -f examples/backup-schedule/paused-s3.yaml
 kubectl get backupschedule nightly-snapshot -n tidb-canary -o yaml
 ```
 
-Keep a new schedule paused until `SchedulingReady` has observed the current
-`metadata.generation` and `status.lastScheduleTime` is present. First
-reconciliation initializes the scheduling cursor and creates no Backup.
+Keep a new schedule paused until both `SchedulingReady` and `RetentionReady`
+have observed the current `metadata.generation`, and
+`status.lastScheduleTime` is present. First reconciliation initializes the
+scheduling cursor and creates no Backup. Retention also sends no deletion
+requests while paused.
 
 When the canary is ready, unpause it:
 
@@ -153,8 +157,8 @@ an error.
 ### Pause, resume, and catch-up
 
 While `spec.pause` is `true`, due occurrences advance
-`status.lastScheduleTime` without creating Backups. Running Backup work is not
-cancelled.
+`status.lastScheduleTime` without creating Backups, and retention sends no
+deletion requests. Running Backup work is not cancelled.
 
 Resuming never backfills occurrences consumed while paused. Editing the cron
 expression retains the existing cursor and applies the new expression to future
@@ -199,6 +203,58 @@ schedule UID, and the occurrence in UTC seconds. A recreated schedule receives
 a new UID and therefore different Backup names. Generated Backups have no owner
 reference, so deleting a BackupSchedule does not delete its Backups.
 
+Do not manually change the identity metadata, target, mode, or storage
+destination of a managed Backup. Such changes cause retention to fail closed.
+
+## Retention and remote cleanup
+
+`maxBackups` is a quota for terminal, nonterminating successful Backup objects.
+It is not a bound on remote snapshots, bytes, or storage cost.
+
+When `maxBackups` is greater than zero, retention keeps:
+
+- The newest `maxBackups` Backups with `Complete=True`.
+- The newest five Backups with `Failed=True` or `Invalid=True`, as a separate
+  combined diagnostic history.
+- Every active or terminating Backup.
+
+Retention selects the oldest excess object and sends at most one delete request
+per reconciliation. A missing or zero `maxBackups` disables all pruning,
+including the failed and invalid history limit. Pausing the schedule freezes
+retention without cancelling active Backup work.
+
+The generated Backup preserves `backupTemplate.cleanPolicy`. Retention never
+rewrites that policy and never removes cleanup finalizers. Remote cleanup
+therefore follows the existing Backup behavior:
+
+| `cleanPolicy` | Result after retention requests deletion of the Backup CR |
+| --- | --- |
+| Omitted or `Retain` | Remote snapshot data is retained. |
+| `OnFailure` | Remote data is cleaned only when the Backup has `Failed=True`; otherwise it is retained. |
+| `Delete` | The Backup cleanup flow attempts to delete remote data before object removal completes. |
+
+For example, `maxBackups: 3` with `cleanPolicy: Retain` can leave more than
+three remote snapshots even after only three completed, nonterminating Backup
+CRs remain. A cleanup failure or finalizer stall can also leave an excess
+Backup in `Terminating`. The controller never selects that object again, but it
+does not count terminating objects toward the quota, so later reconciliations
+may request deletion of other excess Backups while the first remains stalled.
+Monitor terminating objects as well as provider storage.
+
+Before every delete, retention directly rereads the candidate Backup and its
+BackupSchedule from the API server. It revalidates the schedule UID and
+generation, pause and deletion state, immutable target, Backup UID and resource
+version, specification, identity metadata, destination, and terminal state.
+The delete request carries both UID and resource-version preconditions. Any
+change makes the plan stale and triggers a fresh calculation.
+
+Historical Backups for the current immutable schedule UID remain eligible
+after supported template storage edits. Each Backup is validated against its
+own durable identity and canonical destination, not the current template. A
+malformed current-UID Backup blocks all retention deletion for that schedule
+until the object is repaired or removed. Backups from an older schedule UID and
+unrelated Backups are never adopted into the retention quota.
+
 ## Status and fail-closed behavior
 
 The scheduling controller owns only:
@@ -208,17 +264,26 @@ The scheduling controller owns only:
 - `status.lastBackupTime`
 - The `SchedulingReady` condition
 
+The independent retention controller owns only the `RetentionReady` condition.
+Both loops use optimistic status updates so a conflict forces a fresh read and
+reconciliation instead of overwriting fields owned by the other loop.
+
 `SchedulingReady=True` with reason `Reconciled` means the controller reached a
 safe result. A pause, overlap wait, or no-op can be a safe result.
 `SchedulingReady=False` with reason `InvalidSpec` means validation failed before
 side effects. Reason `ReconcilerError` means scheduling could not complete
 safely. Check `observedGeneration` before treating the condition as current.
 
-An invalid schedule creates nothing and does not advance its cursor. A
-conflicting deterministic name is not adopted or overwritten. Ambiguous Backup
-status blocks scheduling. Identity metadata is a controller convention, not an
-unforgeable security boundary, so grant Backup write access only to trusted
-principals.
+`RetentionReady=True` with reason `Reconciled` means retention safely paused,
+was disabled, found no excess Backup, or accepted one deletion request.
+`RetentionReady=False` uses the same `InvalidSpec` and `ReconcilerError`
+reasons. Check its `observedGeneration` independently.
+
+An invalid schedule creates nothing, deletes nothing, and does not advance its
+cursor. A conflicting deterministic name is not adopted or overwritten.
+Ambiguous Backup status blocks scheduling and retention. Identity metadata is a
+controller convention, not an unforgeable security boundary, so grant Backup
+write access only to trusted principals.
 
 ## Rollout order
 
@@ -228,22 +293,29 @@ Activation makes every visible BackupSchedule eligible for reconciliation:
 2. Review or pause every existing object before activation.
 3. Deploy the updated `br.pingcap.com_backupschedules.yaml` CRD.
 4. Migrate stored objects to the required immutable `spec.cluster` contract.
-5. Deploy the updated TiDB Operator controller binary.
-6. Create the canary schedule paused with an isolated prefix and
-   `cleanPolicy: Retain`.
+5. Deploy and validate the scheduling-only Stage 1 binary with `maxBackups`
+   omitted or `0`.
+6. Add Backup `delete` permission and deploy the Stage 2 binary containing the
+   independent retention controller.
+7. Keep the canary paused with an isolated prefix and `cleanPolicy: Retain`
+   until both readiness conditions observe the current generation.
+8. Enable a positive `maxBackups` only after the scheduling baseline and
+   retention inventory have been reviewed.
 
 The CRD must be deployed before the binary because the controller writes the
-new cursor and condition fields. The source RBAC marker grants Backup `create`
-but not `delete` for this stage. The current Helm chart groups BR resources
-under broader wildcard permissions, so inspect rendered release RBAC as part of
-deployment review.
+new cursor and condition fields. The Stage 2 source RBAC marker grants Backup
+`delete` in addition to the Stage 1 `create` permission. The current Helm chart
+groups BR resources under broader wildcard permissions, so inspect rendered
+release RBAC as part of deployment review.
 
 ## Staging validation
 
 Use a disposable namespace and isolated storage prefix:
 
-1. Apply the schedule paused with `maxBackups` omitted or `0`.
-2. Verify current `SchedulingReady` and `status.lastScheduleTime`.
+1. Establish the Stage 1 baseline with the schedule paused, `maxBackups: 0`,
+   `cleanPolicy: Retain`, and no other scheduler targeting the same Cluster.
+2. Deploy Stage 2 and verify current `SchedulingReady`, `RetentionReady`, and
+   `status.lastScheduleTime`.
 3. Confirm first observation creates no Backup.
 4. Unpause and observe exactly one Backup at the next due UTC occurrence.
 5. Verify its deterministic name, projected same-namespace target, metadata,
@@ -255,22 +327,39 @@ Use a disposable namespace and isolated storage prefix:
    destination.
 9. Start a manual snapshot Backup for the same target. Verify the schedule waits
    without advancing its cursor until the blocker becomes terminal.
-10. Exercise pause and resume and confirm paused occurrences are not backfilled.
-11. Restore one canary snapshot successfully.
+10. Exercise pause and resume. Confirm paused occurrences are not backfilled
+    and no retention delete request is sent while paused.
+11. With disposable Backup history, set a small positive `maxBackups` while
+    keeping `cleanPolicy: Retain`. Verify oldest-first, one-at-a-time Backup CR
+    deletion, separate failed and invalid history, and preservation of remote
+    snapshots.
+12. Verify active, terminating, malformed current-UID, older-UID, and unrelated
+    Backups are never selected. Repair the malformed fixture before continuing.
+13. If remote deletion is required, test `cleanPolicy: Delete` separately with
+    an explicitly approved disposable bucket or prefix. Confirm cleanup and
+    finalizer behavior before using that policy outside staging.
+14. Restore one retained canary snapshot successfully.
 
 Keep any external or legacy scheduler and native creation disabled from sharing
 a target throughout the test and cutover.
 
 ## Rollback
 
-If activation must be rolled back:
+To roll Stage 2 back safely to the scheduling-only Stage 1 binary:
 
-1. Set `spec.pause: true` on every native schedule.
-2. Verify `SchedulingReady` has observed the new generation.
-3. Roll back the controller binary.
-4. Leave the updated CRD installed until stored-object compatibility is
+1. Atomically set `spec.pause: true` and `spec.maxBackups: 0` on every native
+   schedule.
+2. Verify both readiness conditions have observed the new generation and that
+   no Backup is still entering deletion.
+3. Roll back the controller binary to Stage 1. Stage 1 intentionally treats a
+   positive `maxBackups` as `InvalidSpec`, which is why the quota must be
+   disabled before rollback.
+4. Remove the added Backup `delete` permission when the release mechanism
+   permits it.
+5. Leave the updated CRD installed until stored-object compatibility is
    reviewed.
-5. Preserve generated Backups and remote snapshots for audit and recovery.
+6. Preserve generated Backups and remote snapshots for audit and recovery.
 
-Pausing does not cancel a running Backup. Rolling back the scheduling controller
-does not delete generated Backups or remote data.
+Pausing does not cancel a running Backup. Stage 1 no longer updates
+`RetentionReady`; treat the old condition as stale after rollback. Rolling back
+the retention controller does not delete generated Backups or remote data.
