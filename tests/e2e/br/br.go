@@ -18,7 +18,6 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"math/rand"
 	"os"
 	"os/signal"
 	"path"
@@ -1267,7 +1266,14 @@ func getPDServiceResourceName(tcName string) string {
 	return "svc/" + getGroupName(tcName, "pdg") + "-pd"
 }
 
-func createTidbCluster(f *brframework.Framework, name string, version string, enableTLS bool, skipCA bool) error {
+func createTidbCluster(
+	f *brframework.Framework,
+	name string,
+	version string,
+	enableTLS bool,
+	skipCA bool,
+	waitForDeletion ...bool,
+) error {
 	ctx := context.TODO()
 
 	clusterPatches := []data.ClusterPatch{
@@ -1309,7 +1315,14 @@ func createTidbCluster(f *brframework.Framework, name string, version string, en
 
 	ginkgo.DeferCleanup(func(ctx context.Context) {
 		ginkgo.By(fmt.Sprintf("Delete the cluster: %s", cluster.Name))
-		f.Must(f.Client.Delete(ctx, cluster))
+		err := f.Client.Delete(ctx, cluster)
+		if apierrors.IsNotFound(err) {
+			return
+		}
+		f.Must(err)
+		if len(waitForDeletion) > 0 && waitForDeletion[0] {
+			f.Must(waiter.WaitForObjectDeleted(ctx, f.Client, cluster, waiter.LongTaskTimeout))
+		}
 	})
 	return nil
 }
@@ -1689,26 +1702,29 @@ func checkDataIsSame(backupDSN, restoreDSN string) error {
 			return fmt.Errorf("table(%s) has %v records in backup but %v in restore", backupTable, backupRecordCount, restoreRecordCount)
 		}
 
-		x := rand.Intn(backupRecordCount)
-		backupRecord, err := getRecord(backup, backupTable, x)
+		if backupRecordCount == 0 {
+			continue
+		}
+		offset := backupRecordCount / 2
+		backupRecord, err := getRecord(backup, backupTable, offset)
 		if err != nil {
 			return err
 		}
-		restoreRecord, err := getRecord(restore, restoreTable, x)
+		restoreRecord, err := getRecord(restore, restoreTable, offset)
 		if err != nil {
 			return err
 		}
 		if backupRecord != restoreRecord {
-			return fmt.Errorf("%vth record in table(%s) is not equal", x, backupTable)
+			return fmt.Errorf("record at offset %v in table(%s) is not equal", offset, backupTable)
 		}
 	}
 
 	return nil
 }
 
-func getRecord(db *sql.DB, table string, x int) (string, error) {
+func getRecord(db *sql.DB, table string, offset int) (string, error) {
 	var bs string
-	row := db.QueryRow(fmt.Sprintf("SELECT 'raw_bytes' FROM %s WHERE id = %d", table, x))
+	row := db.QueryRow(fmt.Sprintf("SELECT raw_bytes FROM %s ORDER BY id LIMIT 1 OFFSET %d", table, offset))
 	err := row.Scan(&bs)
 	if err != nil {
 		return "", err
