@@ -150,7 +150,27 @@ func TestValidateBackupSchedule(t *testing.T) {
 	scheduleWithoutNestedTarget.Spec.BackupTemplate.BR = nil
 	require.NoError(t, ValidateBackupSchedule(scheduleWithoutNestedTarget))
 
-	for _, cluster := range []string{"UPPERCASE", "bad_name", strings.Repeat("a", 254)} {
+	for name, azblob := range map[string]*brv1alpha1.AzblobStorageProvider{
+		"account only": {Container: "container", StorageAccount: "account"},
+		"token only":   {Container: "container", SasToken: "token"},
+	} {
+		t.Run("reject Azure Blob "+name, func(t *testing.T) {
+			schedule := validSchedule()
+			schedule.Spec.BackupTemplate.StorageProvider = brv1alpha1.StorageProvider{Azblob: azblob}
+			require.Error(t, ValidateBackupSchedule(schedule))
+		})
+	}
+	scheduleWithInlineAzureCredentials := validSchedule()
+	scheduleWithInlineAzureCredentials.Spec.BackupTemplate.StorageProvider = brv1alpha1.StorageProvider{
+		Azblob: &brv1alpha1.AzblobStorageProvider{
+			Container:      "container",
+			StorageAccount: "account",
+			SasToken:       "token",
+		},
+	}
+	require.NoError(t, ValidateBackupSchedule(scheduleWithInlineAzureCredentials))
+
+	for _, cluster := range []string{"UPPERCASE", "bad_name", ".leading", "trailing-", strings.Repeat("a", 254)} {
 		t.Run("invalid cluster "+cluster[:min(len(cluster), 16)], func(t *testing.T) {
 			schedule := validSchedule()
 			schedule.Spec.Cluster.Name = cluster
@@ -456,7 +476,6 @@ func TestStatusOwnership(t *testing.T) {
 	scheduling := findCondition(schedule.Status.Conditions, ConditionSchedulingReady)
 	require.NotNil(t, scheduling)
 	assert.EqualValues(t, 7, scheduling.ObservedGeneration)
-
 }
 
 func TestConditionMessageFitsAPISchema(t *testing.T) {
