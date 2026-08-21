@@ -1,0 +1,23 @@
+# Replace the namespace, cluster, bucket, region, prefix, and credential source
+# before applying this example. Keep the schedule paused through its first
+# reconciliation and staging review.
+apiVersion: br.pingcap.com/v1alpha1
+kind: BackupSchedule
+metadata:
+  name: nightly-snapshot
+  namespace: tidb-canary
+spec:
+  cluster:
+    name: canary
+  schedule: "0 2 * * *"
+  pause: true
+  maxBackups: 0
+  backupTemplate:
+    backupMode: snapshot
+    cleanPolicy: Retain
+    s3:
+      provider: aws
+      region: us-west-2
+      bucket: replace-with-canary-bucket
+      prefix: tidb-canary/native-backups
+      secretName: s3-backup-credentials
