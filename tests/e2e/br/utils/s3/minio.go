@@ -16,7 +16,6 @@ package s3
 
 import (
 	"context"
-	"encoding/base64"
 	"fmt"
 	"time"
 
@@ -74,10 +73,11 @@ func (s *minioStorage) Init(ctx context.Context, ns, accessKey, secretKey string
 		return err
 	}
 
-	ep, err := s.forwardPort(ctx, ns)
+	ep, cancel, err := s.forwardPort(ctx, ns)
 	if err != nil {
 		return err
 	}
+	defer cancel()
 
 	mc, err := minio.New(ep, accessKey, secretKey, false)
 	if err != nil {
@@ -89,15 +89,15 @@ func (s *minioStorage) Init(ctx context.Context, ns, accessKey, secretKey string
 	return nil
 }
 
-func (s *minioStorage) forwardPort(ctx context.Context, ns string) (string, error) {
+func (s *minioStorage) forwardPort(ctx context.Context, ns string) (string, context.CancelFunc, error) {
 	if s.fw == nil {
-		return getDefaultAddr(ns), nil
+		return getDefaultAddr(ns), func() {}, nil
 	}
-	host, port, _, err := k8s.ForwardOnePort(s.fw, ns, "svc/"+minioName, 9000)
+	host, port, cancel, err := k8s.ForwardOnePort(s.fw, ns, "svc/"+minioName, 9000)
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
-	return fmt.Sprintf("%s:%d", host, port), nil
+	return fmt.Sprintf("%s:%d", host, port), cancel, nil
 }
 
 func getDefaultAddr(ns string) string {
@@ -129,21 +129,28 @@ func (s *minioStorage) IsDataCleaned(ctx context.Context, ns, prefix string) (bo
 	if err != nil {
 		return false, err
 	}
-	ep, err := s.forwardPort(ctx, ns)
+	ep, cancel, err := s.forwardPort(ctx, ns)
 	if err != nil {
 		return false, err
 	}
+	defer cancel()
 	mc, err := minio.New(ep, accessKey, secretKey, false)
 	if err != nil {
 		return false, err
 	}
 	doneCh := make(chan struct{})
 	defer close(doneCh)
-	objs := mc.ListObjects(minioBucket, prefix, true, doneCh)
-	if len(objs) == 0 {
-		return true, nil
+	return isObjectStreamEmpty(mc.ListObjects(minioBucket, prefix, true, doneCh))
+}
+
+func isObjectStreamEmpty(objects <-chan minio.ObjectInfo) (bool, error) {
+	for object := range objects {
+		if object.Err != nil {
+			return false, object.Err
+		}
+		return false, nil
 	}
-	return false, nil
+	return true, nil
 }
 
 func (s *minioStorage) accessSecret(ns string) (string, string, error) {
@@ -152,30 +159,16 @@ func (s *minioStorage) accessSecret(ns string) (string, string, error) {
 	if err != nil {
 		return "", "", err
 	}
-	accessKeyBytes, ok1 := secret.Data["access_key"]
-	secretKeyBytes, ok2 := secret.Data["secret_key"]
+	return minioCredentials(secret)
+}
+
+func minioCredentials(secret *corev1.Secret) (string, string, error) {
+	accessKey, ok1 := secret.Data["access_key"]
+	secretKey, ok2 := secret.Data["secret_key"]
 	if !ok1 || !ok2 {
 		return "", "", fmt.Errorf("access_key or secret_key not found")
 	}
-	accessKey, err := base64DecodeToString(accessKeyBytes)
-	if err != nil {
-		return "", "", err
-	}
-	secretKey, err := base64DecodeToString(secretKeyBytes)
-	if err != nil {
-		return "", "", err
-	}
-
-	return accessKey, secretKey, nil
-}
-
-func base64DecodeToString(src []byte) (string, error) {
-	dstLen := base64.StdEncoding.DecodedLen(len(src))
-	dst := make([]byte, dstLen)
-	if _, err := base64.StdEncoding.Decode(dst, src); err != nil {
-		return "", err
-	}
-	return string(dst), nil
+	return string(accessKey), string(secretKey), nil
 }
 
 func getMinioSecret(ns, accessKey, secretKey string) *corev1.Secret {
