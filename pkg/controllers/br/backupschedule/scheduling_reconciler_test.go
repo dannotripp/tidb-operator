@@ -513,10 +513,6 @@ func TestSchedulingInvalidSpecDoesNotAdvanceOrCreate(t *testing.T) {
 	}{
 		{name: "malformed cron", mutate: func(schedule *brv1alpha1.BackupSchedule) { schedule.Spec.Schedule = "invalid" }},
 		{name: "impossible cron", mutate: func(schedule *brv1alpha1.BackupSchedule) { schedule.Spec.Schedule = "0 0 30 2 *" }},
-		{name: "positive maxBackups", mutate: func(schedule *brv1alpha1.BackupSchedule) {
-			maxBackups := int32(1)
-			schedule.Spec.MaxBackups = &maxBackups
-		}},
 	}
 
 	for _, tt := range tests {

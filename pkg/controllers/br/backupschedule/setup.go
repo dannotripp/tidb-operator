@@ -32,11 +32,12 @@ import (
 
 const (
 	SchedulingControllerName = "backup-schedule-scheduling"
+	RetentionControllerName  = "backup-schedule-retention"
 )
 
-// Setup installs the target index and registers the scheduling controller.
-// Backup events are mapped explicitly because generated Backups intentionally
-// have no BackupSchedule owner reference.
+// Setup installs the shared indexes and registers independent scheduling and
+// retention controllers. Backup events are mapped explicitly because generated
+// Backups intentionally have no BackupSchedule owner reference.
 func Setup(ctx context.Context, mgr manager.Manager, managerClient client.Client) error {
 	if err := RegisterIndexes(ctx, mgr); err != nil {
 		return err
@@ -46,6 +47,7 @@ func Setup(ctx context.Context, mgr manager.Manager, managerClient client.Client
 	mapper := BackupEventMapper{Reader: managerClient}
 	locks := NewTargetLocks()
 	scheduling := NewSchedulingReconciler(managerClient, apiReader, clock.RealClock{}, locks)
+	retention := NewRetentionReconciler(apiReader, managerClient)
 
 	if err := ctrl.NewControllerManagedBy(mgr).
 		Named(SchedulingControllerName).
@@ -57,6 +59,18 @@ func Setup(ctx context.Context, mgr manager.Manager, managerClient client.Client
 		WithOptions(controller.Options{RateLimiter: k8s.NewRateLimiter()}).
 		Complete(scheduling); err != nil {
 		return fmt.Errorf("create %s controller: %w", SchedulingControllerName, err)
+	}
+
+	if err := ctrl.NewControllerManagedBy(mgr).
+		Named(RetentionControllerName).
+		For(&brv1alpha1.BackupSchedule{}).
+		Watches(
+			&brv1alpha1.Backup{},
+			handler.EnqueueRequestsFromMapFunc(mapper.RetentionRequests),
+		).
+		WithOptions(controller.Options{RateLimiter: k8s.NewRateLimiter()}).
+		Complete(retention); err != nil {
+		return fmt.Errorf("create %s controller: %w", RetentionControllerName, err)
 	}
 
 	return nil

@@ -24,6 +24,7 @@ import (
 	"path/filepath"
 	goruntime "runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -256,17 +257,13 @@ func TestIntegrationStatusSubresourceConflictAndFreshRetry(t *testing.T) {
 				},
 			}), nil
 		},
-		"external": func(latest *brv1alpha1.BackupSchedule) (bool, error) {
-			latest.Status.LastCompact = "external-status"
-			apiMeta.SetStatusCondition(&latest.Status.Conditions, metav1.Condition{
-				Type:               "ExternalReady",
+		"retention": func(latest *brv1alpha1.BackupSchedule) (bool, error) {
+			return ApplyRetentionStatus(latest, &metav1.Condition{
 				Status:             metav1.ConditionTrue,
-				Reason:             "Updated",
-				Message:            "external status won or retried",
-				ObservedGeneration: latest.Generation,
+				Reason:             ReasonReconciled,
+				Message:            "retention status won or retried",
 				LastTransitionTime: now,
-			})
-			return true, nil
+			}), nil
 		},
 	}
 	type updateResult struct {
@@ -327,12 +324,77 @@ func TestIntegrationStatusSubresourceConflictAndFreshRetry(t *testing.T) {
 	require.NoError(t, integrationClient.Get(t.Context(), key, verified))
 	assert.Equal(t, "status-race-backup", verified.Status.LastBackup)
 	require.NotNil(t, verified.Status.LastScheduleTime)
-	assert.Equal(t, "external-status", verified.Status.LastCompact)
 	require.NotNil(t, apiMeta.FindStatusCondition(verified.Status.Conditions, ConditionSchedulingReady))
-	require.NotNil(t, apiMeta.FindStatusCondition(verified.Status.Conditions, "ExternalReady"))
+	require.NotNil(t, apiMeta.FindStatusCondition(verified.Status.Conditions, ConditionRetentionReady))
 }
 
-func TestIntegrationManagerCacheAndSchedulingBackupWatch(t *testing.T) {
+func TestIntegrationDeleteRetentionCandidatePreconditionRaces(t *testing.T) {
+	t.Run("resourceVersion", func(t *testing.T) {
+		schedule, candidate := createIntegrationRetentionCandidate(t, "resource-version")
+		originalUID := candidate.Backup.UID
+		writer := &racingDeleteWriter{
+			Client: integrationClient,
+			beforeDelete: func(ctx context.Context, _ client.Object) error {
+				changed := &brv1alpha1.Backup{}
+				if err := integrationClient.Get(ctx, client.ObjectKeyFromObject(candidate.Backup), changed); err != nil {
+					return err
+				}
+				changed.Annotations["integration-test.pingcap.com/raced"] = "resource-version"
+				return integrationClient.Update(ctx, changed)
+			},
+		}
+
+		err := DeleteRetentionCandidate(t.Context(), integrationClient, writer, schedule, &candidate)
+		require.Error(t, err)
+		assert.True(t, apierrors.IsConflict(err), "expected a real API conflict, got %v", err)
+		remaining := &brv1alpha1.Backup{}
+		require.NoError(t, integrationClient.Get(t.Context(), client.ObjectKeyFromObject(candidate.Backup), remaining))
+		assert.Equal(t, originalUID, remaining.UID)
+		assert.NotEqual(t, candidate.Backup.ResourceVersion, remaining.ResourceVersion)
+	})
+
+	t.Run("UID", func(t *testing.T) {
+		schedule, candidate := createIntegrationRetentionCandidate(t, "uid")
+		originalUID := candidate.Backup.UID
+		writer := &racingDeleteWriter{
+			Client: integrationClient,
+			beforeDelete: func(ctx context.Context, _ client.Object) error {
+				live := &brv1alpha1.Backup{}
+				if err := integrationClient.Get(ctx, client.ObjectKeyFromObject(candidate.Backup), live); err != nil {
+					return err
+				}
+				if err := integrationClient.Delete(ctx, live); err != nil {
+					return err
+				}
+				replacement := live.DeepCopy()
+				replacement.ResourceVersion = ""
+				replacement.UID = ""
+				replacement.Generation = 0
+				replacement.CreationTimestamp = metav1.Time{}
+				replacement.DeletionTimestamp = nil
+				replacement.DeletionGracePeriodSeconds = nil
+				replacement.ManagedFields = nil
+				replacement.Status = brv1alpha1.BackupStatus{}
+				return wait.PollUntilContextTimeout(ctx, 20*time.Millisecond, 5*time.Second, true, func(ctx context.Context) (bool, error) {
+					err := integrationClient.Create(ctx, replacement)
+					if apierrors.IsAlreadyExists(err) {
+						return false, nil
+					}
+					return err == nil, err
+				})
+			},
+		}
+
+		err := DeleteRetentionCandidate(t.Context(), integrationClient, writer, schedule, &candidate)
+		require.Error(t, err)
+		assert.True(t, apierrors.IsConflict(err), "expected a real API conflict, got %v", err)
+		remaining := &brv1alpha1.Backup{}
+		require.NoError(t, integrationClient.Get(t.Context(), client.ObjectKeyFromObject(candidate.Backup), remaining))
+		assert.NotEqual(t, originalUID, remaining.UID)
+	})
+}
+
+func TestIntegrationManagerCacheAndBackupWatchMappings(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	manager, err := ctrl.NewManager(integrationConfig, ctrl.Options{
 		Scheme:                 integrationScheme,
@@ -380,10 +442,21 @@ func TestIntegrationManagerCacheAndSchedulingBackupWatch(t *testing.T) {
 			return false
 		}
 		return observed.Status.LastScheduleTime != nil &&
-			apiMeta.FindStatusCondition(observed.Status.Conditions, ConditionSchedulingReady) != nil
+			apiMeta.FindStatusCondition(observed.Status.Conditions, ConditionSchedulingReady) != nil &&
+			apiMeta.FindStatusCondition(observed.Status.Conditions, ConditionRetentionReady) != nil
 	}, 15*time.Second, 100*time.Millisecond)
 
 	require.Greater(t, controllerReconcileCount(t, SchedulingControllerName), float64(0))
+	require.Greater(t, controllerReconcileCount(t, RetentionControllerName), float64(0))
+	indexed := &brv1alpha1.BackupScheduleList{}
+	require.NoError(t, manager.GetClient().List(
+		t.Context(),
+		indexed,
+		client.MatchingFields{backupScheduleUIDIndex: string(schedule.UID)},
+	))
+	require.Len(t, indexed.Items, 1)
+	assert.Equal(t, schedule.Name, indexed.Items[0].Name)
+
 	baseline := waitForControllerQuiet(t, SchedulingControllerName)
 
 	probe := &brv1alpha1.Backup{
@@ -407,6 +480,28 @@ func TestIntegrationManagerCacheAndSchedulingBackupWatch(t *testing.T) {
 
 	require.NoError(t, integrationClient.Delete(t.Context(), probe))
 	waitForControllerIncrement(t, SchedulingControllerName, baseline, "Backup delete")
+
+	retentionBaseline := waitForControllerQuiet(t, RetentionControllerName)
+	retentionProbe, err := RenderBackup(schedule, time.Date(2026, 8, 20, 15, 0, 0, 0, time.UTC))
+	require.NoError(t, err)
+	retentionProbeKey := client.ObjectKeyFromObject(retentionProbe)
+	require.NoError(t, integrationClient.Create(t.Context(), retentionProbe))
+	waitForControllerIncrement(t, RetentionControllerName, retentionBaseline, "managed Backup create")
+	retentionBaseline = waitForControllerQuiet(t, RetentionControllerName)
+
+	retentionProbe = &brv1alpha1.Backup{}
+	require.NoError(t, integrationClient.Get(
+		t.Context(),
+		retentionProbeKey,
+		retentionProbe,
+	))
+	retentionProbe.Annotations["integration-test.pingcap.com/event"] = "update"
+	require.NoError(t, integrationClient.Update(t.Context(), retentionProbe))
+	waitForControllerIncrement(t, RetentionControllerName, retentionBaseline, "managed Backup update")
+	retentionBaseline = waitForControllerQuiet(t, RetentionControllerName)
+
+	require.NoError(t, integrationClient.Delete(t.Context(), retentionProbe))
+	waitForControllerIncrement(t, RetentionControllerName, retentionBaseline, "managed Backup delete")
 }
 
 func loadIntegrationCRD(name string) (*apiextensionsv1.CustomResourceDefinition, error) {
@@ -572,6 +667,69 @@ func (reader *statusBarrierReader) Get(
 		return nil
 	case <-ctx.Done():
 		return ctx.Err()
+	}
+}
+
+type racingDeleteWriter struct {
+	client.Client
+	beforeDelete func(context.Context, client.Object) error
+	once         sync.Once
+}
+
+func (writer *racingDeleteWriter) Delete(
+	ctx context.Context,
+	obj client.Object,
+	opts ...client.DeleteOption,
+) error {
+	var raceErr error
+	writer.once.Do(func() {
+		if writer.beforeDelete != nil {
+			raceErr = writer.beforeDelete(ctx, obj)
+		}
+	})
+	if raceErr != nil {
+		return raceErr
+	}
+	return writer.Client.Delete(ctx, obj, opts...)
+}
+
+func createIntegrationRetentionCandidate(
+	t *testing.T,
+	suffix string,
+) (*brv1alpha1.BackupSchedule, RetentionCandidate) {
+	t.Helper()
+	namespace := createIntegrationNamespace(t, "backupschedule-delete-"+suffix+"-")
+	schedule := newIntegrationSchedule(namespace, "retention-"+suffix)
+	maxBackups := int32(1)
+	schedule.Spec.MaxBackups = &maxBackups
+	require.NoError(t, integrationClient.Create(t.Context(), schedule))
+	require.NoError(t, integrationClient.Get(t.Context(), client.ObjectKeyFromObject(schedule), schedule))
+
+	scheduledTime := time.Date(2026, 8, 20, 14, 0, 0, 0, time.UTC)
+	backup, err := RenderBackup(schedule, scheduledTime)
+	require.NoError(t, err)
+	require.NoError(t, integrationClient.Create(t.Context(), backup))
+	require.NoError(t, integrationClient.Get(t.Context(), client.ObjectKeyFromObject(backup), backup))
+	backup.Status.Conditions = []metav1.Condition{{
+		Type:               string(brv1alpha1.BackupComplete),
+		Status:             metav1.ConditionTrue,
+		Reason:             "Completed",
+		Message:            "integration fixture completed",
+		ObservedGeneration: backup.Generation,
+		LastTransitionTime: metav1.NewTime(scheduledTime.Add(time.Minute)),
+	}}
+	require.NoError(t, integrationClient.Status().Update(t.Context(), backup))
+	require.NoError(t, integrationClient.Get(t.Context(), client.ObjectKeyFromObject(backup), backup))
+
+	parsedTime, err := ParseScheduledTime(backup)
+	require.NoError(t, err)
+	target, err := ResolveBackupTarget(backup)
+	require.NoError(t, err)
+	return schedule, RetentionCandidate{
+		Backup:        backup.DeepCopy(),
+		ScheduledTime: parsedTime,
+		Target:        target,
+		State:         BackupSucceeded,
 	}
 }
 

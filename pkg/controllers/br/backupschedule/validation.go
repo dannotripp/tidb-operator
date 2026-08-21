@@ -105,7 +105,7 @@ func validateFutureOccurrence(expression string, schedule cron.Schedule) (cron.S
 }
 
 // ValidateBackupSchedule validates the supported v2 subset before scheduling
-// performs side effects.
+// or retention performs side effects.
 //
 //nolint:gocyclo // Explicit field-by-field rejection keeps the supported subset auditable.
 func ValidateBackupSchedule(schedule *brv1alpha1.BackupSchedule) error {
@@ -118,9 +118,6 @@ func ValidateBackupSchedule(schedule *brv1alpha1.BackupSchedule) error {
 	if schedule.Spec.MaxBackups != nil {
 		if *schedule.Spec.MaxBackups < 0 {
 			return fmt.Errorf("spec.maxBackups must be nonnegative")
-		}
-		if *schedule.Spec.MaxBackups > 0 {
-			return fmt.Errorf("spec.maxBackups must be omitted or zero while retention is disabled")
 		}
 	}
 	if schedule.Spec.MaxReservedTime != nil {

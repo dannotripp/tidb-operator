@@ -100,7 +100,6 @@ func TestValidateBackupSchedule(t *testing.T) {
 		mutate func(*brv1alpha1.BackupSchedule)
 	}{
 		{name: "negative max backups", mutate: func(s *brv1alpha1.BackupSchedule) { value := int32(-1); s.Spec.MaxBackups = &value }},
-		{name: "positive max backups", mutate: func(s *brv1alpha1.BackupSchedule) { value := int32(3); s.Spec.MaxBackups = &value }},
 		{name: "reserved time", mutate: func(s *brv1alpha1.BackupSchedule) { s.Spec.MaxReservedTime = &stringValue }},
 		{name: "log template", mutate: func(s *brv1alpha1.BackupSchedule) { s.Spec.LogBackupTemplate = &brv1alpha1.BackupSpec{} }},
 		{name: "compact span", mutate: func(s *brv1alpha1.BackupSchedule) { s.Spec.CompactSpan = &stringValue }},
@@ -140,7 +139,7 @@ func TestValidateBackupSchedule(t *testing.T) {
 		})
 	}
 
-	for _, value := range []*int32{nil, ptr(int32(0))} {
+	for _, value := range []*int32{nil, ptr(int32(0)), ptr(int32(3))} {
 		schedule := validSchedule()
 		schedule.Spec.MaxBackups = value
 		require.NoError(t, ValidateBackupSchedule(schedule))
@@ -476,6 +475,27 @@ func TestStatusOwnership(t *testing.T) {
 	scheduling := findCondition(schedule.Status.Conditions, ConditionSchedulingReady)
 	require.NotNil(t, scheduling)
 	assert.EqualValues(t, 7, scheduling.ObservedGeneration)
+
+	lastScheduleTime := schedule.Status.LastScheduleTime.DeepCopy()
+	lastBackupTime := schedule.Status.LastBackupTime.DeepCopy()
+	changed = ApplyRetentionStatus(schedule, &metav1.Condition{
+		Status:             metav1.ConditionTrue,
+		Reason:             ReasonReconciled,
+		Message:            "retained",
+		LastTransitionTime: now,
+	})
+	assert.True(t, changed)
+	assert.Equal(t, "legacy", schedule.Status.LastCompact)
+	assert.Equal(t, "backup", schedule.Status.LastBackup)
+	assert.Equal(t, lastScheduleTime, schedule.Status.LastScheduleTime)
+	assert.Equal(t, lastBackupTime, schedule.Status.LastBackupTime)
+	assert.Equal(t, scheduling, findCondition(schedule.Status.Conditions, ConditionSchedulingReady))
+	retention := findCondition(schedule.Status.Conditions, ConditionRetentionReady)
+	require.NotNil(t, retention)
+	assert.EqualValues(t, 7, retention.ObservedGeneration)
+
+	changed = ApplyRetentionStatus(schedule, retention)
+	assert.False(t, changed)
 }
 
 func TestConditionMessageFitsAPISchema(t *testing.T) {

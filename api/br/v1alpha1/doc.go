@@ -28,7 +28,7 @@
 // +kubebuilder:rbac:groups=core,resources=nodes,verbs=get;list;watch
 // +kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;list;watch;create;update;patch;delete
 //
-// +kubebuilder:rbac:groups=br.pingcap.com,resources=backups,verbs=get;list;watch;create;update
+// +kubebuilder:rbac:groups=br.pingcap.com,resources=backups,verbs=get;list;watch;create;update;delete
 // +kubebuilder:rbac:groups=br.pingcap.com,resources=backups/status,verbs=get;update;patch
 //
 // +kubebuilder:rbac:groups=br.pingcap.com,resources=restores,verbs=get;list;watch;update

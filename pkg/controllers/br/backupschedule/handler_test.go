@@ -37,6 +37,7 @@ import (
 func TestBackupScheduleIndexFunctions(t *testing.T) {
 	schedule := indexedSchedule("backups", "hourly", "uid-hourly", "example")
 	assert.Equal(t, []string{"backups/example"}, indexBackupScheduleByTarget(schedule))
+	assert.Equal(t, []string{"uid-hourly"}, indexBackupScheduleByUID(schedule))
 	schedule.Spec.BackupTemplate.BR = nil
 	assert.Equal(t, []string{"backups/example"}, indexBackupScheduleByTarget(schedule))
 
@@ -46,7 +47,10 @@ func TestBackupScheduleIndexFunctions(t *testing.T) {
 	schedule.Spec.BackupTemplate.BR.ClusterNamespace = ""
 	schedule.Spec.Cluster.Name = "INVALID"
 	assert.Nil(t, indexBackupScheduleByTarget(schedule))
+	schedule.UID = ""
+	assert.Nil(t, indexBackupScheduleByUID(schedule))
 	assert.Nil(t, indexBackupScheduleByTarget(&brv1alpha1.Backup{}))
+	assert.Nil(t, indexBackupScheduleByUID(&brv1alpha1.Backup{}))
 }
 
 func TestBackupEventMapper(t *testing.T) {
@@ -66,8 +70,16 @@ func TestBackupEventMapper(t *testing.T) {
 		{NamespacedName: types.NamespacedName{Namespace: "backups", Name: "second"}},
 	}, mapper.SchedulingRequests(context.Background(), manual))
 
+	managed := manual.DeepCopy()
+	managed.Labels = map[string]string{ScheduleUIDLabel: "uid-second"}
+	assert.Equal(t, []reconcile.Request{
+		{NamespacedName: types.NamespacedName{Namespace: "backups", Name: "second"}},
+	}, mapper.RetentionRequests(context.Background(), managed))
+
 	manual.Spec.BR = nil
 	assert.Nil(t, mapper.SchedulingRequests(context.Background(), manual))
+	managed.Labels = nil
+	assert.Nil(t, mapper.RetentionRequests(context.Background(), managed))
 }
 
 func TestBackupUpdateEventsMapOldAndNewAssociations(t *testing.T) {
@@ -101,6 +113,20 @@ func TestBackupUpdateEventsMapOldAndNewAssociations(t *testing.T) {
 		)
 		assert.Equal(t, requestSet(first, second), drainRequests(t, queue))
 	})
+
+	t.Run("retention UID", func(t *testing.T) {
+		eventHandler := handler.EnqueueRequestsFromMapFunc(mapper.RetentionRequests)
+		queue := workqueue.NewTypedRateLimitingQueue(
+			workqueue.DefaultTypedItemBasedRateLimiter[reconcile.Request](),
+		)
+		t.Cleanup(queue.ShutDown)
+		eventHandler.Update(
+			context.Background(),
+			event.TypedUpdateEvent[client.Object]{ObjectOld: oldBackup, ObjectNew: newBackup},
+			queue,
+		)
+		assert.Equal(t, requestSet(first, second), drainRequests(t, queue))
+	})
 }
 
 func TestBackupCreateDeleteAndGenericEventsMapAssociations(t *testing.T) {
@@ -116,37 +142,44 @@ func TestBackupCreateDeleteAndGenericEventsMapAssociations(t *testing.T) {
 	}
 	want := requestSet(schedule)
 
-	eventHandler := handler.EnqueueRequestsFromMapFunc(mapper.SchedulingRequests)
+	for name, mapFunc := range map[string]handler.MapFunc{
+		"scheduling": mapper.SchedulingRequests,
+		"retention":  mapper.RetentionRequests,
+	} {
+		t.Run(name, func(t *testing.T) {
+			eventHandler := handler.EnqueueRequestsFromMapFunc(mapFunc)
 
-	t.Run("create", func(t *testing.T) {
-		queue := newRequestQueue(t)
-		eventHandler.Create(
-			context.Background(),
-			event.TypedCreateEvent[client.Object]{Object: backup},
-			queue,
-		)
-		assert.Equal(t, want, drainRequests(t, queue))
-	})
+			t.Run("create", func(t *testing.T) {
+				queue := newRequestQueue(t)
+				eventHandler.Create(
+					context.Background(),
+					event.TypedCreateEvent[client.Object]{Object: backup},
+					queue,
+				)
+				assert.Equal(t, want, drainRequests(t, queue))
+			})
 
-	t.Run("delete", func(t *testing.T) {
-		queue := newRequestQueue(t)
-		eventHandler.Delete(
-			context.Background(),
-			event.TypedDeleteEvent[client.Object]{Object: backup},
-			queue,
-		)
-		assert.Equal(t, want, drainRequests(t, queue))
-	})
+			t.Run("delete", func(t *testing.T) {
+				queue := newRequestQueue(t)
+				eventHandler.Delete(
+					context.Background(),
+					event.TypedDeleteEvent[client.Object]{Object: backup},
+					queue,
+				)
+				assert.Equal(t, want, drainRequests(t, queue))
+			})
 
-	t.Run("generic", func(t *testing.T) {
-		queue := newRequestQueue(t)
-		eventHandler.Generic(
-			context.Background(),
-			event.TypedGenericEvent[client.Object]{Object: backup},
-			queue,
-		)
-		assert.Equal(t, want, drainRequests(t, queue))
-	})
+			t.Run("generic", func(t *testing.T) {
+				queue := newRequestQueue(t)
+				eventHandler.Generic(
+					context.Background(),
+					event.TypedGenericEvent[client.Object]{Object: backup},
+					queue,
+				)
+				assert.Equal(t, want, drainRequests(t, queue))
+			})
+		})
+	}
 }
 
 func indexedFakeClient(t *testing.T, schedules ...*brv1alpha1.BackupSchedule) client.Client {
@@ -161,6 +194,7 @@ func indexedFakeClient(t *testing.T, schedules ...*brv1alpha1.BackupSchedule) cl
 		WithScheme(scheme).
 		WithObjects(objects...).
 		WithIndex(&brv1alpha1.BackupSchedule{}, backupScheduleTargetIndex, indexBackupScheduleByTarget).
+		WithIndex(&brv1alpha1.BackupSchedule{}, backupScheduleUIDIndex, indexBackupScheduleByUID).
 		Build()
 }
 

@@ -29,6 +29,7 @@ import (
 
 const (
 	ConditionSchedulingReady = "SchedulingReady"
+	ConditionRetentionReady  = "RetentionReady"
 
 	ReasonReconciled      = "Reconciled"
 	ReasonInvalidSpec     = "InvalidSpec"
@@ -123,7 +124,7 @@ type SchedulingStatus struct {
 }
 
 // ApplySchedulingStatus mutates only scheduling-owned status fields and
-// preserves all legacy status.
+// preserves the retention condition and all legacy status.
 func ApplySchedulingStatus(schedule *brv1alpha1.BackupSchedule, desired *SchedulingStatus) bool {
 	before := schedule.Status.DeepCopy()
 	schedule.Status.LastScheduleTime = copyTime(desired.LastScheduleTime)
@@ -131,6 +132,16 @@ func ApplySchedulingStatus(schedule *brv1alpha1.BackupSchedule, desired *Schedul
 	schedule.Status.LastBackupTime = copyTime(desired.LastBackupTime)
 	condition := desired.Condition.DeepCopy()
 	condition.Type = ConditionSchedulingReady
+	condition.ObservedGeneration = schedule.Generation
+	apiMeta.SetStatusCondition(&schedule.Status.Conditions, *condition)
+	return !reflect.DeepEqual(before, &schedule.Status)
+}
+
+// ApplyRetentionStatus mutates only the retention-owned condition.
+func ApplyRetentionStatus(schedule *brv1alpha1.BackupSchedule, desired *metav1.Condition) bool {
+	before := schedule.Status.DeepCopy()
+	condition := desired.DeepCopy()
+	condition.Type = ConditionRetentionReady
 	condition.ObservedGeneration = schedule.Generation
 	apiMeta.SetStatusCondition(&schedule.Status.Conditions, *condition)
 	return !reflect.DeepEqual(before, &schedule.Status)
