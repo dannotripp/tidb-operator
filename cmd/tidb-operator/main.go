@@ -49,6 +49,7 @@ import (
 	"github.com/pingcap/tidb-operator/v2/pkg/adoption"
 	"github.com/pingcap/tidb-operator/v2/pkg/client"
 	"github.com/pingcap/tidb-operator/v2/pkg/controllers/br/backup"
+	"github.com/pingcap/tidb-operator/v2/pkg/controllers/br/backupschedule"
 	"github.com/pingcap/tidb-operator/v2/pkg/controllers/br/restore"
 	"github.com/pingcap/tidb-operator/v2/pkg/controllers/br/tibr"
 	"github.com/pingcap/tidb-operator/v2/pkg/controllers/br/tibrgc"
@@ -289,7 +290,7 @@ func setup(ctx context.Context, mgr ctrl.Manager) error {
 		setupLog.Error(err, "unable to setup controllers")
 		os.Exit(1)
 	}
-	if err := setupBRControllers(mgr, c, pdcm); err != nil {
+	if err := setupBRControllers(ctx, mgr, c, pdcm); err != nil {
 		setupLog.Error(err, "unable to setup BR controllers")
 		os.Exit(1)
 	}
@@ -657,7 +658,7 @@ func setupControllers(
 	return nil
 }
 
-func setupBRControllers(mgr ctrl.Manager, c client.Client, pdcm pdm.PDClientManager) error {
+func setupBRControllers(ctx context.Context, mgr ctrl.Manager, c client.Client, pdcm pdm.PDClientManager) error {
 	if err := backup.Setup(mgr, c, pdcm, backup.Config{
 		BackupManagerImage: brConf.backupManagerImage,
 	}); err != nil {
@@ -668,10 +669,21 @@ func setupBRControllers(mgr ctrl.Manager, c client.Client, pdcm pdm.PDClientMana
 	}); err != nil {
 		return fmt.Errorf("unable to create controller Restore: %w", err)
 	}
+	if err := backupschedule.Setup(ctx, mgr, c); err != nil {
+		return fmt.Errorf("unable to create controller BackupSchedule: %w", err)
+	}
 	return nil
 }
 
 func BuildCacheByObject() map[client.Object]cache.ByObject {
+	volumeAttributesClassEnabled := kubefeat.Stage(kubefeat.VolumeAttributesClass).Enabled(kubefeat.BETA)
+	return buildCacheByObject(volumeAttributesClassEnabled)
+}
+
+// buildCacheByObject contains the deterministic cache policy. Keeping feature
+// discovery outside this helper lets tests exercise the complete object map
+// without contacting a Kubernetes API server.
+func buildCacheByObject(volumeAttributesClassEnabled bool) map[client.Object]cache.ByObject {
 	managedByOperator := labels.SelectorFromSet(labels.Set{
 		v1alpha1.LabelKeyManagedBy: v1alpha1.LabelValManagedByOperator,
 	})
@@ -792,6 +804,9 @@ func BuildCacheByObject() map[client.Object]cache.ByObject {
 		&brv1alpha1.Backup{}: {
 			Label: labels.Everything(),
 		},
+		&brv1alpha1.BackupSchedule{}: {
+			Label: backupScheduleCacheOptions().Label,
+		},
 		&brv1alpha1.Restore{}: {
 			Label: labels.Everything(),
 		},
@@ -824,11 +839,15 @@ func BuildCacheByObject() map[client.Object]cache.ByObject {
 		},
 		// TiBRGC objects end
 	}
-	if kubefeat.Stage(kubefeat.VolumeAttributesClass).Enabled(kubefeat.BETA) {
+	if volumeAttributesClassEnabled {
 		byObj[&storagev1beta1.VolumeAttributesClass{}] = cache.ByObject{
 			Label: labels.Everything(),
 		}
 	}
 
 	return byObj
+}
+
+func backupScheduleCacheOptions() cache.ByObject {
+	return cache.ByObject{Label: labels.Everything()}
 }
