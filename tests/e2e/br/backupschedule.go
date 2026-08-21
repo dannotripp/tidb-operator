@@ -59,7 +59,7 @@ var _ = ginkgo.Describe(
 		f := brframework.NewFramework("backup-schedule")
 		f.SetupBootstrapSQL("SET PASSWORD FOR 'root'@'%' = 'pingcap';")
 
-		ginkgo.It("validates snapshot scheduling and recovery", func(ctx context.Context) {
+		ginkgo.It("validates snapshot scheduling, recovery, and retention", func(ctx context.Context) {
 			const clusterName = "backup-schedule-cluster"
 			const databaseName = "backupschedule"
 			namespace := f.Namespace.Name
@@ -206,6 +206,16 @@ var _ = ginkgo.Describe(
 				first.Name,
 				backupCompleteTimeout,
 			)).To(gomega.Succeed())
+			gomega.Eventually(func(g gomega.Gomega) {
+				cleaned, err := f.Storage.IsDataCleaned(ctx, namespace, first.Spec.S3.Prefix)
+				g.Expect(err).NotTo(gomega.HaveOccurred())
+				g.Expect(cleaned).To(
+					gomega.BeFalse(),
+					"the completed Backup must have remote data before retention is enabled",
+				)
+			}).WithTimeout(backupScheduleControlPlaneTimeout).
+				WithPolling(backupSchedulePollInterval).
+				Should(gomega.Succeed())
 
 			ginkgo.By("Restoring seeded data into a distinct disposable Cluster")
 			const restoreClusterName = "backup-schedule-restore"
@@ -308,6 +318,32 @@ var _ = ginkgo.Describe(
 				WithPolling(backupSchedulePollInterval).
 				Should(gomega.Equal(2))
 
+			ginkgo.By("Enabling positive retention only after both controllers are ready")
+			gomega.Expect(updateE2EBackupSchedule(ctx, f.Client, schedule, func(current *brv1alpha1.BackupSchedule) {
+				current.Spec.MaxBackups = ptr.To[int32](1)
+			})).To(gomega.Succeed())
+			schedule = waitForE2EBackupScheduleReady(ctx, f.Client, schedule)
+			gomega.Eventually(func() bool {
+				err := f.Client.Get(ctx, ctrlclient.ObjectKeyFromObject(&first), &brv1alpha1.Backup{})
+				return apierrors.IsNotFound(err)
+			}).WithTimeout(backupScheduleControlPlaneTimeout).
+				WithPolling(backupSchedulePollInterval).
+				Should(gomega.BeTrue())
+			gomega.Expect(f.Client.Get(
+				ctx,
+				ctrlclient.ObjectKeyFromObject(&second),
+				&brv1alpha1.Backup{},
+			)).To(gomega.Succeed())
+			gomega.Eventually(func(g gomega.Gomega) {
+				cleaned, err := f.Storage.IsDataCleaned(ctx, namespace, first.Spec.S3.Prefix)
+				g.Expect(err).NotTo(gomega.HaveOccurred())
+				g.Expect(cleaned).To(
+					gomega.BeFalse(),
+					"Retain must preserve the pruned Backup's remote data",
+				)
+			}).WithTimeout(backupScheduleControlPlaneTimeout).
+				WithPolling(backupSchedulePollInterval).
+				Should(gomega.Succeed())
 		})
 	},
 )
@@ -355,6 +391,13 @@ func waitForE2EBackupScheduleReady(
 			g,
 			current,
 			backupschedulectrl.ConditionSchedulingReady,
+			metav1.ConditionTrue,
+			backupschedulectrl.ReasonReconciled,
+		)
+		assertE2ECondition(
+			g,
+			current,
+			backupschedulectrl.ConditionRetentionReady,
 			metav1.ConditionTrue,
 			backupschedulectrl.ReasonReconciled,
 		)
