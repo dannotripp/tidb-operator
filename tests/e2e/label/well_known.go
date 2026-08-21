@@ -77,6 +77,8 @@ var (
 	KindBasic = ginkgo.Label("k:Basic")
 	// KindBR are tests for br
 	KindBR = ginkgo.Label("k:BR")
+	// KindBackupSchedule are tests for native BackupSchedule reconciliation.
+	KindBackupSchedule = ginkgo.Label("k:BackupSchedule")
 	// KindAvail are tests to test availablity
 	KindAvail = ginkgo.Label("k:Avail")
 	// KindNextGen are tests to test next-gen
